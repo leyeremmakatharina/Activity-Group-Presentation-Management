@@ -3,10 +3,12 @@ import io
 import json
 import os
 import random
+import re
 import secrets
 import threading
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import qrcode
 import streamlit as st
@@ -16,13 +18,16 @@ st.set_page_config(page_title="Chip Game", page_icon="🎲")
 COLORS = [("Red", "#e5484d"), ("Blue", "#3b82f6"), ("Green", "#22a06b"),
           ("Yellow", "#f5c518"), ("Purple", "#8b5cf6")]
 TEAMS, NCOL, CHIPS = 16, 5, 5
-PHASES = ["round1", "table", "round2", "results"]
+PHASES = ["round1", "table", "task", "round2", "results"]
 PHASE_LABEL = {
-    "round1": "1. Round 1 (same vs. different color)",
+    "round1": "1. Round 1: chips (same color vs. different color)",
     "table": "2. Show table numbers",
-    "round2": "3. Round 2 (teammate vs. same color)",
-    "results": "4. Close game",
+    "task": "3. Team task: best food at the university",
+    "round2": "4. Round 2: chips (own team vs. same color)",
+    "results": "5. Close game",
 }
+TEAM_TEMPLATES = ["Team {f}", "The {f} Crew", "{f} Squad", "{f} United",
+                  "The Mighty {f}", "{f} Legends"]
 POLL_SECONDS = 4
 STATE_FILE = Path(__file__).with_name("state.json")
 
@@ -39,10 +44,11 @@ def get_store():
     # One shared object for every visitor of this app. It is also backed up to
     # a file, so a crash or restart of the app process does not lose the game.
     store = {"lock": threading.RLock(), "phase": "round1",
-             "order": random.sample(range(TEAMS), TEAMS), "people": {}}
+             "order": random.sample(range(TEAMS), TEAMS), "people": {}, "teams": {}}
     try:
         data = json.loads(STATE_FILE.read_text())
-        store.update(phase=data["phase"], order=data["order"], people=data["people"])
+        store.update(phase=data["phase"], order=data["order"], people=data["people"],
+                     teams=data.get("teams", {}))
     except Exception:
         pass
     return store
@@ -55,7 +61,7 @@ def save_state():
     try:
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps({"phase": S["phase"], "order": S["order"],
-                                   "people": S["people"]}))
+                                   "people": S["people"], "teams": S["teams"]}))
         os.replace(tmp, STATE_FILE)
     except Exception:
         pass
@@ -89,12 +95,39 @@ def set_phase(ph):
         save_state()
 
 
-def teammate(pid):
-    me = S["people"][pid]
-    mates = [q for k, q in S["people"].items() if k != pid and q["team"] == me["team"]]
-    if not mates:
-        return None
-    return sorted(mates, key=lambda q: (q["color"] - me["color"]) % NCOL)[0]
+def clean_food(text):
+    text = re.sub(r"[^\w\s\-&'.]|_", "", text or "")
+    text = " ".join(text.split())[:30]
+    return text[:1].upper() + text[1:]
+
+
+def make_team_name(food):
+    # Always returns a name that no other team has, even if several teams pick
+    # the same food.
+    used = {t["name"].lower() for t in S["teams"].values()}
+    for tpl in TEAM_TEMPLATES:
+        name = tpl.format(f=food)
+        if name.lower() not in used:
+            return name
+    i = 2
+    while f"Team {food} {i}".lower() in used:
+        i += 1
+    return f"Team {food} {i}"
+
+
+def submit_team(pid, food):
+    with S["lock"]:
+        key = str(S["people"][pid]["team"])
+        if key not in S["teams"]:  # the first submission of a team counts
+            S["teams"][key] = {"food": food, "name": make_team_name(food),
+                               "by": S["people"][pid]["name"]}
+            save_state()
+        return S["teams"][key]
+
+
+def team_name(p):
+    t = S["teams"].get(str(p["team"]))
+    return t["name"] if t else f"Team {p['team'] + 1}"
 
 
 def banner(ci, text):
@@ -132,6 +165,33 @@ def chip_choice(key, label_a, label_b):
     return None
 
 
+def team_task(pid):
+    p = S["people"][pid]
+    t = S["teams"].get(str(p["team"]))
+    st.subheader("Team task")
+    if t is None:
+        st.write("Discuss with your team for **1 to 2 minutes**: what is the **best food "
+                 "you can buy at the university?** Agree on one answer and type it in. "
+                 "Only one person per team needs to submit.")
+        food = st.text_input("Best food at the university", max_chars=30,
+                             placeholder="e.g. Currywurst", key=f"food_{pid}")
+        if st.button("Submit for our team", type="primary", key=f"food_btn_{pid}"):
+            clean = clean_food(food)
+            if not clean:
+                st.error("Please enter a food.")
+            else:
+                submit_team(pid, clean)
+                st.rerun()
+    else:
+        st.write(f"Your team chose **{html.escape(t['food'])}**. Your team name is:")
+        st.markdown(
+            f'<div style="background:#14202b;color:#fff;padding:24px;border-radius:14px;'
+            f'text-align:center;font-size:1.8rem;font-weight:800">{html.escape(t["name"])}</div>',
+            unsafe_allow_html=True)
+        st.write("")
+        st.write("Please wait for the next step.")
+
+
 @st.fragment(run_every=POLL_SECONDS)
 def play(pid):
     p = S["people"].get(pid)
@@ -159,17 +219,18 @@ def play(pid):
         st.markdown(
             f'<div style="text-align:center;font-size:4rem;font-weight:800">{p["team"] + 1}</div>',
             unsafe_allow_html=True)
-        st.write("Go to this table. Your team will play a game together.")
-    elif phase == "round2":
+        st.write("Go to this table and wait for the next step.")
+    elif phase == "task":
         st.caption(f"Your table: {p['team'] + 1}")
+        team_task(pid)
+    elif phase == "round2":
+        tname = team_name(p)
+        st.caption(f"Your table: {p['team'] + 1}  |  Your team: {html.escape(tname)}")
         if p["r2"] is None:
             st.subheader("Round 2")
-            tm = teammate(pid)
-            label_b = (f"**{html.escape(tm['name'])}**, your teammate ({COLORS[tm['color']][0]})"
-                       if tm else "a teammate from your table")
             a = chip_choice(f"r2_{pid}",
                             f"someone with your color ({cname}) from a different team",
-                            label_b)
+                            f"someone from your team **“{html.escape(tname)}”**")
             if a is not None:
                 answer(pid, "r2", a)
                 st.rerun()
@@ -200,16 +261,24 @@ def participant():
         st.rerun()
 
 
+COLS = ["name", "table", "team_name", "color", "r1_same_color", "r1_different_color",
+        "r2_own_team", "r2_same_color_other_team"]
+
+
 def get_df():
     with S["lock"]:
         people = list(S["people"].values())
-    rows = [{"name": q["name"], "team": q["team"] + 1, "color": COLORS[q["color"]][0],
-             "round1_chips_same_color": q["r1"], "round2_chips_same_color_other_team": q["r2"]}
-            for q in people]
-    cols = ["name", "team", "color", "round1_chips_same_color",
-            "round2_chips_same_color_other_team"]
-    df = pd.DataFrame(rows, columns=cols)
-    for c in cols[3:]:
+    rows = []
+    for q in people:
+        r1, r2 = q["r1"], q["r2"]
+        rows.append({"name": q["name"], "table": q["team"] + 1, "team_name": team_name(q),
+                     "color": COLORS[q["color"]][0],
+                     "r1_same_color": r1,
+                     "r1_different_color": None if r1 is None else CHIPS - r1,
+                     "r2_own_team": None if r2 is None else CHIPS - r2,
+                     "r2_same_color_other_team": r2})
+    df = pd.DataFrame(rows, columns=COLS)
+    for c in COLS[4:]:
         df[c] = pd.to_numeric(df[c])
     return df
 
@@ -217,34 +286,77 @@ def get_df():
 @st.fragment(run_every=POLL_SECONDS)
 def stats_view():
     df = get_df()
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Joined", len(df))
-    c2.metric("Round 1 done", int(df["round1_chips_same_color"].notna().sum()))
-    c3.metric("Round 2 done", int(df["round2_chips_same_color_other_team"].notna().sum()))
+    c2.metric("Round 1 done", int(df["r1_same_color"].notna().sum()))
+    c3.metric("Teams with name", len(S["teams"]))
+    c4.metric("Round 2 done", int(df["r2_same_color_other_team"].notna().sum()))
+
+
+def pct(x):
+    return f"{x / CHIPS * 100:.0f}%"
+
+
+def result_chart(m1, m2_team, m2_color):
+    rows = [{"round": "Round 1", "choice": "Same color", "chips": m1,
+             "group": "in-group", "label": f"{m1:.1f}"},
+            {"round": "Round 1", "choice": "Different color", "chips": CHIPS - m1,
+             "group": "other", "label": f"{CHIPS - m1:.1f}"}]
+    if m2_team is not None:
+        rows += [{"round": "Round 2", "choice": "Own team", "chips": m2_team,
+                  "group": "in-group", "label": f"{m2_team:.1f}"},
+                 {"round": "Round 2", "choice": "Same color, other team", "chips": m2_color,
+                  "group": "other", "label": f"{m2_color:.1f}"}]
+    df = pd.DataFrame(rows)
+    x = alt.X("choice:N", title=None, sort=None,
+              axis=alt.Axis(labelAngle=0, labelLimit=110, labelFontSize=13))
+    y = alt.Y("chips:Q", title="Average chips (of 5)",
+              scale=alt.Scale(domain=[0, CHIPS]))
+    color = alt.Color("group:N", legend=None,
+                      scale=alt.Scale(domain=["in-group", "other"],
+                                      range=["#2f6fdd", "#b8c0cc"]))
+    bars = alt.Chart().mark_bar(size=70).encode(x=x, y=y, color=color)
+    text = alt.Chart().mark_text(dy=-8, fontSize=18, fontWeight="bold").encode(
+        x=x, y=y, text="label:N")
+    chart = (alt.layer(bars, text, data=df).properties(width=230, height=300)
+             .facet(column=alt.Column("round:N", title=None, sort=None,
+                                      header=alt.Header(labelFontSize=18))))
+    st.altair_chart(chart)
 
 
 @st.fragment(run_every=POLL_SECONDS)
 def results_view():
     df = get_df()
-    r1 = df["round1_chips_same_color"].dropna()
-    r2 = df["round2_chips_same_color_other_team"].dropna()
+    r1 = df["r1_same_color"].dropna()
+    r2c = df["r2_same_color_other_team"].dropna()
+    r2t = df["r2_own_team"].dropna()
     if r1.empty:
         st.info("No answers yet.")
         return
-    both = df.dropna(subset=["round1_chips_same_color", "round2_chips_same_color_other_team"])
-    diff = both["round2_chips_same_color_other_team"] - both["round1_chips_same_color"]
+    m1 = float(r1.mean())
+    has2 = len(r2t) > 0
+    m2t = float(r2t.mean()) if has2 else None
+    m2c = float(r2c.mean()) if has2 else None
+
+    st.subheader("Where did the chips go?")
+    result_chart(m1, m2t, m2c)
+    st.caption("Blue bars: the option that favors people like me "
+               "(same color in Round 1, own team in Round 2). 5 chips per person.")
+
+    both = df.dropna(subset=["r1_same_color", "r2_own_team"])
+    more_team = int((both["r2_own_team"] > both["r1_same_color"]).sum())
     c1, c2, c3 = st.columns(3)
-    c1.metric("Round 1: avg chips to same color", f"{r1.mean():.2f}", help=f"n = {len(r1)}")
-    c2.metric("Round 2: avg chips to same color", f"{r2.mean():.2f}" if len(r2) else "–",
-              help=f"n = {len(r2)}")
-    c3.metric("Change per person", f"{diff.mean():+.2f}" if len(diff) else "–",
-              help=f"{int((diff < 0).sum())} of {len(diff)} gave less to the same color")
-    st.caption(f"Neutral would be {CHIPS / 2:.1f} of {CHIPS} chips.")
-    chart = pd.DataFrame({"Avg chips to same color": [r1.mean(), r2.mean() if len(r2) else 0]},
-                         index=["Round 1", "Round 2"])
-    st.bar_chart(chart, y_label="Chips (of 5)")
-    if len(r2):
-        st.write(f"Round 2: on average **{CHIPS - r2.mean():.2f}** chips went to the teammate.")
+    c1.metric("Round 1: chips to same color", f"{m1:.1f} of {CHIPS}", help=f"n = {len(r1)}")
+    c2.metric("Round 2: chips to own team", f"{m2t:.1f} of {CHIPS}" if has2 else "–",
+              help=f"n = {len(r2t)}")
+    c3.metric("Gave more to team than to same color",
+              f"{more_team} of {len(both)}" if has2 else "–",
+              help="Per person: chips to own team in Round 2 compared with chips "
+                   "to the same color in Round 1.")
+    st.write(f"**Round 1:** {pct(m1)} of all chips went to someone with the same color.")
+    if has2:
+        st.write(f"**Round 2:** {pct(m2t)} of all chips went to someone from the own team, "
+                 f"only {pct(m2c)} to the same color on another team.")
 
 
 def admin():
@@ -276,15 +388,18 @@ def admin():
         st.divider()
         st.write("**Testing**")
         if st.button("Add 20 test players with random answers"):
+            foods = ["Pizza", "Pizza", "Currywurst", "Pasta", "Doener", "Schnitzel"]
             for i in range(20):
                 pid = join(f"Test {len(S['people']) + 1}")
                 answer(pid, "r1", random.randint(0, CHIPS))
                 answer(pid, "r2", random.randint(0, CHIPS))
+                submit_team(pid, random.choice(foods))
             st.rerun()
         if st.checkbox("I want to reset the game (deletes all players and answers)"):
             if st.button("Reset now"):
                 with S["lock"]:
                     S["people"].clear()
+                    S["teams"].clear()
                     S["phase"] = "round1"
                     random.shuffle(S["order"])
                     save_state()
@@ -295,8 +410,16 @@ def admin():
         df = get_df()
         st.download_button("Download CSV", df.to_csv(index=False), "chip_game_results.csv",
                            "text/csv")
+        with st.expander("Team names"):
+            with S["lock"]:
+                trows = [{"table": int(k) + 1, "food": v["food"], "team_name": v["name"],
+                          "entered_by": v["by"]} for k, v in S["teams"].items()]
+            if trows:
+                st.dataframe(pd.DataFrame(trows).sort_values("table"))
+            else:
+                st.write("No team has entered a food yet.")
         with st.expander("All players"):
-            st.dataframe(df.sort_values(["team", "color"]))
+            st.dataframe(df.sort_values(["table", "color"]))
 
 
 if st.query_params.get("admin") is not None:
