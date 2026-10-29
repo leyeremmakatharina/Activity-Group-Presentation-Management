@@ -1,428 +1,484 @@
+"""
+Chip game for the presentation "Cultural diversity, helping behaviour and shared team identity"
+(based on the minimal group paradigm, Tajfel et al., 1971)
+
+Flow for every participant (all on their own phone):
+  1. Join            -> app assigns a colour (a purely visible, outward feature) and a table
+  2. Round 1         -> split 5 chips between two ANONYMOUS participants (same colour vs. different colour)
+                        + 1 question on how connected they feel to their colour group
+  3. Team time       -> go to the assigned table (one person per colour), find something you share in your
+                        leisure time, choose a team name based on it (= shared team identity)
+  4. Round 2         -> split 5 chips between (same colour, other team) and (someone from your own team)
+                        + 1 question on how connected they feel to their team
+  5. Done            -> host opens the dashboard with ?admin=1
+
+Host dashboard: open the app URL with  ?admin=1  and enter the password
+(set ADMIN_PASSWORD in the Streamlit Cloud secrets, default: "admin").
+"""
+
 import html
-import io
 import json
-import os
+import math
 import random
-import re
-import secrets
+import statistics
 import threading
 from pathlib import Path
 
-import altair as alt
 import pandas as pd
-import qrcode
 import streamlit as st
 
-st.set_page_config(page_title="Chip Game", page_icon="🎲")
+# ----------------------------------------------------------------------------------------------
+# Settings
+# ----------------------------------------------------------------------------------------------
+N_CHIPS = 5
+BASELINE = N_CHIPS / 2  # 2.5 chips = no preference
+AUTO_TABLES = True  # True: app assigns the table (guarantees one person per colour at each table)
+CONTROL_CONDITION = False  # True: even tables get a control version of round 2 (see README text)
+DATA_FILE = Path("chip_game_data.json")
 
-COLORS = [("Red", "#e5484d"), ("Blue", "#3b82f6"), ("Green", "#22a06b"),
-          ("Yellow", "#f5c518"), ("Purple", "#8b5cf6")]
-TEAMS, NCOL, CHIPS = 16, 5, 5
-PHASES = ["round1", "table", "task", "round2", "results"]
-PHASE_LABEL = {
-    "round1": "1. Round 1: chips (same color vs. different color)",
-    "table": "2. Show table numbers",
-    "task": "3. Team task: best food at the university",
-    "round2": "4. Round 2: chips (own team vs. same color)",
-    "results": "5. Close game",
+COLOURS = {  # name: (background, text colour)
+    "Red": ("#e74c3c", "#ffffff"),
+    "Blue": ("#3498db", "#ffffff"),
+    "Green": ("#27ae60", "#ffffff"),
+    "Yellow": ("#f1c40f", "#222222"),
+    "Purple": ("#8e44ad", "#ffffff"),
 }
-TEAM_TEMPLATES = ["Team {f}", "The {f} Crew", "{f} Squad", "{f} United",
-                  "The Mighty {f}", "{f} Legends"]
-POLL_SECONDS = 4
-STATE_FILE = Path(__file__).with_name("state.json")
+COLOUR_NAMES = list(COLOURS)
 
 try:
-    ADMIN_PIN = str(st.secrets["ADMIN_PIN"])
-    PIN_IS_DEFAULT = False
+    ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
 except Exception:
-    ADMIN_PIN = "1234"
-    PIN_IS_DEFAULT = True
+    ADMIN_PASSWORD = "admin"
+
+st.set_page_config(page_title="Chip Game", page_icon="🪙", layout="centered")
 
 
+# ----------------------------------------------------------------------------------------------
+# Shared storage (one store for all phones, saved to a JSON file in case the app restarts)
+# ----------------------------------------------------------------------------------------------
 @st.cache_resource
 def get_store():
-    # One shared object for every visitor of this app. It is also backed up to
-    # a file, so a crash or restart of the app process does not lose the game.
-    store = {"lock": threading.RLock(), "phase": "round1",
-             "order": random.sample(range(TEAMS), TEAMS), "people": {}, "teams": {}}
-    try:
-        data = json.loads(STATE_FILE.read_text())
-        store.update(phase=data["phase"], order=data["order"], people=data["people"],
-                     teams=data.get("teams", {}))
-    except Exception:
-        pass
+    store = {"lock": threading.Lock(), "participants": {}}
+    if DATA_FILE.exists():
+        try:
+            raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            store["participants"] = {int(k): v for k, v in raw.items()}
+        except Exception:
+            pass
     return store
 
 
-S = get_store()
+store = get_store()
 
 
-def save_state():
+def save():
     try:
-        tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"phase": S["phase"], "order": S["order"],
-                                   "people": S["people"], "teams": S["teams"]}))
-        os.replace(tmp, STATE_FILE)
+        DATA_FILE.write_text(
+            json.dumps(store["participants"], ensure_ascii=False), encoding="utf-8"
+        )
     except Exception:
         pass
 
 
-def join(name):
-    with S["lock"]:
-        n = len(S["people"])
-        r, p = divmod(n, TEAMS)
-        pid = secrets.token_hex(4)
-        # Teams are filled one person at a time in a shuffled order; the color
-        # shifts every round, so each team gets one person per color and colors
-        # stay balanced even if fewer than 80 people join. More than 80 people
-        # simply makes some teams bigger.
-        S["people"][pid] = {"name": name, "team": S["order"][p],
-                            "color": (p + r) % NCOL, "r1": None, "r2": None}
-        save_state()
-        return pid
+def update(p, **fields):
+    with store["lock"]:
+        p.update(fields)
+        save()
 
 
-def answer(pid, key, value):
-    with S["lock"]:
-        if S["people"][pid][key] is None:
-            S["people"][pid][key] = value
-            save_state()
+def new_code(used):
+    while True:
+        code = f"P-{random.randint(100, 999)}"
+        if code not in used:
+            return code
 
 
-def set_phase(ph):
-    with S["lock"]:
-        S["phase"] = ph
-        save_state()
+def join():
+    with store["lock"]:
+        ps = store["participants"]
+        pid = max(ps, default=0) + 1
+        colour = COLOUR_NAMES[(pid - 1) % len(COLOUR_NAMES)]  # round robin -> balanced colours
+        table = None
+        if AUTO_TABLES:
+            # k-th person of a colour sits at table k -> every table has one person of each colour
+            table = sum(1 for q in ps.values() if q["colour"] == colour) + 1
+        p = {
+            "id": pid,
+            "code": new_code({q["code"] for q in ps.values()}),
+            "colour": colour,
+            "table": table,
+        }
+        ps[pid] = p
+        save()
+    return p
 
 
-def clean_food(text):
-    text = re.sub(r"[^\w\s\-&'.]|_", "", text or "")
-    text = " ".join(text.split())[:30]
-    return text[:1].upper() + text[1:]
-
-
-def make_team_name(food):
-    # Always returns a name that no other team has, even if several teams pick
-    # the same food.
-    used = {t["name"].lower() for t in S["teams"].values()}
-    for tpl in TEAM_TEMPLATES:
-        name = tpl.format(f=food)
-        if name.lower() not in used:
-            return name
-    i = 2
-    while f"Team {food} {i}".lower() in used:
-        i += 1
-    return f"Team {food} {i}"
-
-
-def submit_team(pid, food):
-    with S["lock"]:
-        key = str(S["people"][pid]["team"])
-        if key not in S["teams"]:  # the first submission of a team counts
-            S["teams"][key] = {"food": food, "name": make_team_name(food),
-                               "by": S["people"][pid]["name"]}
-            save_state()
-        return S["teams"][key]
-
-
-def team_name(p):
-    t = S["teams"].get(str(p["team"]))
-    return t["name"] if t else f"Team {p['team'] + 1}"
-
-
-def banner(ci, text):
-    hexc = COLORS[ci][1]
-    fg = "#000" if ci == 3 else "#fff"
-    st.markdown(
-        f'<div style="background:{hexc};color:{fg};padding:26px;border-radius:14px;'
-        f'text-align:center;font-size:2rem;font-weight:800">{text}</div>',
-        unsafe_allow_html=True)
-
-
-def chip_choice(key, label_a, label_b):
-    ka, kb = f"{key}_a", f"{key}_b"
-    options = list(range(CHIPS + 1))
-
-    def sync(src, dst):
-        v = st.session_state.get(src)
-        if v is not None:
-            st.session_state[dst] = CHIPS - v
-
-    st.write(f"You have **{CHIPS} chips**. Give all of them away, split between two people.")
-    st.markdown(f"**A:** {label_a}")
-    st.radio("How many chips go to A?", options, index=None, horizontal=True,
-             key=ka, on_change=sync, args=(ka, kb))
-    st.markdown(f"**B:** {label_b}")
-    st.radio("How many chips go to B?", options, index=None, horizontal=True,
-             key=kb, on_change=sync, args=(kb, ka))
-    st.caption(f"The two numbers always add up to {CHIPS}.")
-    if st.button("Submit", type="primary", key=f"{key}_submit"):
-        a = st.session_state.get(ka)
-        if a is None:
-            st.error("Please choose how many chips go to A or B.")
-        else:
-            return int(a)
+def current_participant():
+    ps = store["participants"]
+    pid = st.session_state.get("pid")
+    if pid is None:
+        raw = st.query_params.get("pid")
+        if raw and str(raw).isdigit():
+            pid = int(raw)
+    if pid in ps:
+        st.session_state["pid"] = pid
+        return ps[pid]
     return None
 
 
-def team_task(pid):
-    p = S["people"][pid]
-    t = S["teams"].get(str(p["team"]))
-    st.subheader("Team task")
-    if t is None:
-        st.write("Discuss with your team for **1 to 2 minutes**: what is the **best food "
-                 "you can buy at the university?** Agree on one answer and type it in. "
-                 "Only one person per team needs to submit.")
-        food = st.text_input("Best food at the university", max_chars=30,
-                             placeholder="e.g. Currywurst", key=f"food_{pid}")
-        if st.button("Submit for our team", type="primary", key=f"food_btn_{pid}"):
-            clean = clean_food(food)
-            if not clean:
-                st.error("Please enter a food.")
-            else:
-                submit_team(pid, clean)
-                st.rerun()
-    else:
-        st.write(f"Your team chose **{html.escape(t['food'])}**. Your team name is:")
-        st.markdown(
-            f'<div style="background:#14202b;color:#fff;padding:24px;border-radius:14px;'
-            f'text-align:center;font-size:1.8rem;font-weight:800">{html.escape(t["name"])}</div>',
-            unsafe_allow_html=True)
-        st.write("")
-        st.write("Please wait for the next step.")
+# ----------------------------------------------------------------------------------------------
+# Recipients: anonymous (code + colour only), chosen randomly by the app
+# ----------------------------------------------------------------------------------------------
+def pick_recipient(me, same_colour, other_team_only=False):
+    ps = store["participants"].values()
+    candidates = [
+        q
+        for q in ps
+        if q["id"] != me["id"]
+        and ((q["colour"] == me["colour"]) == same_colour)
+        and (not other_team_only or q.get("table") != me.get("table"))
+    ]
+    if candidates:
+        q = random.choice(candidates)
+        return {"code": q["code"], "colour": q["colour"]}
+    # fallback (e.g. the first people to join): invent an anonymous code
+    colour = me["colour"] if same_colour else random.choice(
+        [c for c in COLOUR_NAMES if c != me["colour"]]
+    )
+    return {"code": f"P-{random.randint(100, 999)}", "colour": colour}
 
 
-@st.fragment(run_every=POLL_SECONDS)
-def play(pid):
-    p = S["people"].get(pid)
-    if p is None:
-        st.warning("The game was reset. Please reload this page to join again.")
-        return
-    phase = S["phase"]
-    cname = COLORS[p["color"]][0]
-    banner(p["color"], f"You are {cname}")
+def get_rec(p, prefix):
+    return {"code": p[prefix + "_code"], "colour": p[prefix + "_colour"]}
+
+
+def set_rec(prefix, rec):
+    return {prefix + "_code": rec["code"], prefix + "_colour": rec["colour"]}
+
+
+# ----------------------------------------------------------------------------------------------
+# Small UI helpers
+# ----------------------------------------------------------------------------------------------
+def banner(p):
+    bg, fg = COLOURS[p["colour"]]
+    team = f" &nbsp;|&nbsp; Team: <b>{html.escape(p['team_name'])}</b>" if p.get("team_name") else ""
+    st.markdown(
+        f"<div style='background:{bg};color:{fg};padding:14px 18px;border-radius:12px;"
+        f"text-align:center;font-size:1.05rem;'>Your colour: <b>{p['colour']}</b>"
+        f" &nbsp;|&nbsp; Your code: <b>{p['code']}</b>{team}</div>",
+        unsafe_allow_html=True,
+    )
     st.write("")
 
-    if p["r1"] is None and phase in ("round1", "table"):
-        st.subheader("Round 1")
-        a = chip_choice(f"r1_{pid}", f"someone with your color ({cname})",
-                        "someone with a different color")
-        if a is not None:
-            answer(pid, "r1", a)
-            st.rerun()
-        return
 
-    if phase == "round1":
-        st.success("Thanks! Please wait for the next step.")
-    elif phase == "table":
-        st.subheader("Your table")
-        st.markdown(
-            f'<div style="text-align:center;font-size:4rem;font-weight:800">{p["team"] + 1}</div>',
-            unsafe_allow_html=True)
-        st.write("Go to this table and wait for the next step.")
-    elif phase == "task":
-        st.caption(f"Your table: {p['team'] + 1}")
-        team_task(pid)
-    elif phase == "round2":
-        tname = team_name(p)
-        st.caption(f"Your table: {p['team'] + 1}  |  Your team: {html.escape(tname)}")
-        if p["r2"] is None:
-            st.subheader("Round 2")
-            a = chip_choice(f"r2_{pid}",
-                            f"someone with your color ({cname}) from a different team",
-                            f"someone from your team **“{html.escape(tname)}”**")
-            if a is not None:
-                answer(pid, "r2", a)
-                st.rerun()
-        else:
-            st.success("Thanks! Please wait for the results.")
+def recipient_card(title, rec=None, text=None, note=""):
+    if rec is not None:
+        bg, fg = COLOURS[rec["colour"]]
+        body = (
+            f"<div style='font-size:1.3rem;font-weight:700;margin-bottom:6px;'>{rec['code']}</div>"
+            f"<span style='background:{bg};color:{fg};padding:4px 14px;border-radius:999px;"
+            f"font-weight:600;'>{rec['colour']}</span>"
+            f"<div style='color:#777;margin-top:8px;font-size:0.9rem;'>{note}</div>"
+        )
     else:
-        st.success("Thank you for playing! Look at the screen for the results.")
+        body = f"<div style='font-size:1.05rem;font-weight:600;'>{text}</div>"
+    st.markdown(
+        f"<div style='border:2px solid #bbb;border-radius:12px;padding:14px;text-align:center;'>"
+        f"<div style='color:#777;margin-bottom:6px;'>{title}</div>{body}</div>",
+        unsafe_allow_html=True,
+    )
 
 
-def participant():
-    pid = st.query_params.get("p")
-    if pid and pid in S["people"]:
-        play(pid)
-        return
-    st.title("🎲 Chip Game")
-    if pid:
-        st.warning("We could not find your earlier session. Please enter your name again.")
-    st.write("Enter your name to join.")
-    with st.form("join"):
-        name = st.text_input("Your name", max_chars=30)
-        ok = st.form_submit_button("Join", type="primary")
-    if ok:
-        name = name.strip()
-        if not name:
-            st.error("Please enter your name.")
-            return
-        st.query_params["p"] = join(name)
+def chip_choice(key, label):
+    choice = st.radio(
+        label, options=list(range(N_CHIPS + 1)), index=None, horizontal=True, key=key
+    )
+    if choice is not None:
+        st.info(f"Person 1: **{choice}** 🪙   |   Person 2: **{N_CHIPS - choice}** 🪙")
+    return choice
+
+
+def scale_question(key, label):
+    return st.radio(
+        label + "  \n(1 = not at all, 7 = very much)",
+        options=list(range(1, 8)),
+        index=None,
+        horizontal=True,
+        key=key,
+    )
+
+
+# ----------------------------------------------------------------------------------------------
+# Screens
+# ----------------------------------------------------------------------------------------------
+def screen_welcome():
+    st.title("🪙 Chip Game")
+    st.write(
+        "Welcome! In this short game you will make a few quick decisions with **chips**. "
+        "There are no right or wrong answers, and everything is anonymous."
+    )
+    if st.button("Join the game", type="primary"):
+        p = join()
+        st.session_state["pid"] = p["id"]
+        st.query_params["pid"] = str(p["id"])  # keeps you in the game if the page reloads
         st.rerun()
 
 
-COLS = ["name", "table", "team_name", "color", "r1_same_color", "r1_different_color",
-        "r2_own_team", "r2_same_color_other_team"]
+def screen_round1(p):
+    banner(p)
+    st.caption(
+        "Your colour is a visible, outward feature. It says nothing about your personality or your interests."
+    )
+    st.header("Round 1")
+    st.write(
+        f"You have **{N_CHIPS} chips**. Give them to two other participants in this room: "
+        "all to one of them, or split them any way you like. "
+        "Participants are anonymous and identified only by a code and a colour."
+    )
+
+    if "r1_same_code" not in p:  # choose recipients once, so they stay stable
+        update(
+            p,
+            **set_rec("r1_same", pick_recipient(p, same_colour=True)),
+            **set_rec("r1_diff", pick_recipient(p, same_colour=False)),
+            r1_first_same=random.random() < 0.5,  # random position (left/right)
+        )
+
+    same, diff = get_rec(p, "r1_same"), get_rec(p, "r1_diff")
+    first, second = (same, diff) if p["r1_first_same"] else (diff, same)
+    c1, c2 = st.columns(2)
+    with c1:
+        recipient_card("Person 1", first)
+    with c2:
+        recipient_card("Person 2", second)
+    st.write("")
+
+    choice = chip_choice("r1_choice", "How many chips do you give to Person 1? (Person 2 gets the rest.)")
+    conn = scale_question("r1_conn", "How connected do you feel to the other participants with your colour?")
+
+    if st.button("Submit Round 1", type="primary", disabled=choice is None or conn is None):
+        to_same = choice if p["r1_first_same"] else N_CHIPS - choice
+        update(p, r1_to_same=to_same, r1_conn=conn)
+        st.rerun()
 
 
-def get_df():
-    with S["lock"]:
-        people = list(S["people"].values())
-    rows = []
-    for q in people:
-        r1, r2 = q["r1"], q["r2"]
-        rows.append({"name": q["name"], "table": q["team"] + 1, "team_name": team_name(q),
-                     "color": COLORS[q["color"]][0],
-                     "r1_same_color": r1,
-                     "r1_different_color": None if r1 is None else CHIPS - r1,
-                     "r2_own_team": None if r2 is None else CHIPS - r2,
-                     "r2_same_color_other_team": r2})
-    df = pd.DataFrame(rows, columns=COLS)
-    for c in COLS[4:]:
-        df[c] = pd.to_numeric(df[c])
-    return df
+def screen_team(p):
+    banner(p)
+    st.header("Team time")
+    if AUTO_TABLES:
+        st.success(f"Please go to **table {p['table']}** now. You will meet your team there.")
+    st.write(
+        "At your table you will find people with **all different colours**. Introduce yourselves and "
+        "find something you **all have in common regarding your leisure time**, for example a "
+        "favourite food, movie, music, hobby, ...  \n"
+        "Your colours are only outward features. What you find now is something you **really share**, "
+        "and it makes you a team. Give your team a name based on it."
+    )
+    common = st.text_input("What do you all have in common?", max_chars=60, key="team_common")
+    team_name = st.text_input("Your team name", max_chars=30, key="team_name_input")
+    table = p.get("table")
+    if not AUTO_TABLES:
+        table = st.number_input("Your table number", min_value=1, max_value=99, step=1, key="table_no")
+
+    ready = bool(common.strip()) and bool(team_name.strip())
+    if st.button("Continue to Round 2", type="primary", disabled=not ready):
+        update(p, team_common=common.strip(), team_name=team_name.strip(), table=int(table))
+        st.rerun()
 
 
-@st.fragment(run_every=POLL_SECONDS)
-def stats_view():
-    df = get_df()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Joined", len(df))
-    c2.metric("Round 1 done", int(df["r1_same_color"].notna().sum()))
-    c3.metric("Teams with name", len(S["teams"]))
-    c4.metric("Round 2 done", int(df["r2_same_color_other_team"].notna().sum()))
+def screen_round2(p):
+    banner(p)
+    st.header("Round 2")
+    control = CONTROL_CONDITION and int(p["table"]) % 2 == 0
+    st.write(
+        f"Again you have **{N_CHIPS} chips**. Give them to two other participants: "
+        "all to one of them, or split them any way you like."
+    )
+
+    if "r2_same_code" not in p:
+        fields = set_rec("r2_same", pick_recipient(p, same_colour=True, other_team_only=True))
+        if control:
+            fields.update(set_rec("r2_other", pick_recipient(p, same_colour=False, other_team_only=True)))
+        update(p, r2_condition="control" if control else "team",
+               r2_first_same=random.random() < 0.5, **fields)
+
+    same = get_rec(p, "r2_same")
+
+    def same_card(title):
+        recipient_card(title, same, note="from another team")
+
+    if p["r2_condition"] == "control":
+        other = get_rec(p, "r2_other")
+
+        def other_card(title):
+            recipient_card(title, other, note="from another team")
+    else:
+        team = html.escape(p["team_name"])
+
+        def other_card(title):
+            recipient_card(title, text=f"Someone from your own team<br>“{team}”")
+
+    first_same = p["r2_first_same"]
+    c1, c2 = st.columns(2)
+    with c1:
+        (same_card if first_same else other_card)("Person 1")
+    with c2:
+        (other_card if first_same else same_card)("Person 2")
+    st.write("")
+
+    choice = chip_choice("r2_choice", "How many chips do you give to Person 1? (Person 2 gets the rest.)")
+    conn = scale_question("r2_conn", "How connected do you feel to your team?")
+
+    if st.button("Submit Round 2", type="primary", disabled=choice is None or conn is None):
+        to_same = choice if first_same else N_CHIPS - choice
+        update(p, r2_to_same=to_same, r2_conn=conn)
+        st.rerun()
 
 
-def pct(x):
-    return f"{x / CHIPS * 100:.0f}%"
+def screen_done(p):
+    banner(p)
+    st.header("Thank you! 🎉")
+    st.write("You are done. Please look up to the front: the results will be shown in a moment.")
 
 
-def result_chart(m1, m2_team, m2_color):
-    rows = [{"round": "Round 1", "choice": "Same color", "chips": m1,
-             "group": "in-group", "label": f"{m1:.1f}"},
-            {"round": "Round 1", "choice": "Different color", "chips": CHIPS - m1,
-             "group": "other", "label": f"{CHIPS - m1:.1f}"}]
-    if m2_team is not None:
-        rows += [{"round": "Round 2", "choice": "Own team", "chips": m2_team,
-                  "group": "in-group", "label": f"{m2_team:.1f}"},
-                 {"round": "Round 2", "choice": "Same color, other team", "chips": m2_color,
-                  "group": "other", "label": f"{m2_color:.1f}"}]
-    df = pd.DataFrame(rows)
-    x = alt.X("choice:N", title=None, sort=None,
-              axis=alt.Axis(labelAngle=0, labelLimit=110, labelFontSize=13))
-    y = alt.Y("chips:Q", title="Average chips (of 5)",
-              scale=alt.Scale(domain=[0, CHIPS]))
-    color = alt.Color("group:N", legend=None,
-                      scale=alt.Scale(domain=["in-group", "other"],
-                                      range=["#2f6fdd", "#b8c0cc"]))
-    bars = alt.Chart().mark_bar(size=70).encode(x=x, y=y, color=color)
-    text = alt.Chart().mark_text(dy=-8, fontSize=18, fontWeight="bold").encode(
-        x=x, y=y, text="label:N")
-    chart = (alt.layer(bars, text, data=df).properties(width=230, height=300)
-             .facet(column=alt.Column("round:N", title=None, sort=None,
-                                      header=alt.Header(labelFontSize=18))))
-    st.altair_chart(chart)
+# ----------------------------------------------------------------------------------------------
+# Host dashboard (?admin=1)
+# ----------------------------------------------------------------------------------------------
+def values(df, col):
+    return df[col].dropna().astype(float).tolist() if col in df else []
 
 
-@st.fragment(run_every=POLL_SECONDS)
-def results_view():
-    df = get_df()
-    r1 = df["r1_same_color"].dropna()
-    r2c = df["r2_same_color_other_team"].dropna()
-    r2t = df["r2_own_team"].dropna()
-    if r1.empty:
-        st.info("No answers yet.")
-        return
-    m1 = float(r1.mean())
-    has2 = len(r2t) > 0
-    m2t = float(r2t.mean()) if has2 else None
-    m2c = float(r2c.mean()) if has2 else None
-
-    st.subheader("Where did the chips go?")
-    result_chart(m1, m2t, m2c)
-    st.caption("Blue bars: the option that favors people like me "
-               "(same color in Round 1, own team in Round 2). 5 chips per person.")
-
-    both = df.dropna(subset=["r1_same_color", "r2_own_team"])
-    more_team = int((both["r2_own_team"] > both["r1_same_color"]).sum())
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Round 1: chips to same color", f"{m1:.1f} of {CHIPS}", help=f"n = {len(r1)}")
-    c2.metric("Round 2: chips to own team", f"{m2t:.1f} of {CHIPS}" if has2 else "–",
-              help=f"n = {len(r2t)}")
-    c3.metric("Gave more to team than to same color",
-              f"{more_team} of {len(both)}" if has2 else "–",
-              help="Per person: chips to own team in Round 2 compared with chips "
-                   "to the same color in Round 1.")
-    st.write(f"**Round 1:** {pct(m1)} of all chips went to someone with the same color.")
-    if has2:
-        st.write(f"**Round 2:** {pct(m2t)} of all chips went to someone from the own team, "
-                 f"only {pct(m2c)} to the same color on another team.")
+def normal_p(t):
+    return 2 * (1 - 0.5 * (1 + math.erf(abs(t) / math.sqrt(2))))
 
 
-def admin():
-    st.title("Admin")
-    pin = st.sidebar.text_input("Admin PIN", type="password")
-    if pin != ADMIN_PIN:
-        st.info("Enter the admin PIN in the sidebar.")
-        return
-    if PIN_IS_DEFAULT:
-        st.warning("You are using the default PIN. Set ADMIN_PIN in the app secrets.")
-    t_qr, t_ctl, t_res = st.tabs(["QR code", "Control", "Results"])
+def one_sample(xs, mu=BASELINE):
+    if len(xs) < 2 or statistics.stdev(xs) == 0:
+        return None
+    t = (statistics.mean(xs) - mu) / (statistics.stdev(xs) / math.sqrt(len(xs)))
+    return t, normal_p(t)
 
-    with t_qr:
-        url = st.text_input("Public app URL", placeholder="https://your-app.streamlit.app")
-        if url.strip():
-            buf = io.BytesIO()
-            qrcode.make(url.strip()).save(buf, format="PNG")
-            st.image(buf.getvalue(), width=420)
-            st.caption("Show this on the projector. Everyone scans it with their phone.")
 
-    with t_ctl:
-        st.write(f"Current step: **{PHASE_LABEL[S['phase']]}**")
-        for ph in PHASES:
-            if st.button(PHASE_LABEL[ph], key=f"ph_{ph}",
-                         type="primary" if ph == S["phase"] else "secondary"):
-                set_phase(ph)
-                st.rerun()
-        stats_view()
-        st.divider()
-        st.write("**Testing**")
-        if st.button("Add 20 test players with random answers"):
-            foods = ["Pizza", "Pizza", "Currywurst", "Pasta", "Doener", "Schnitzel"]
-            for i in range(20):
-                pid = join(f"Test {len(S['people']) + 1}")
-                answer(pid, "r1", random.randint(0, CHIPS))
-                answer(pid, "r2", random.randint(0, CHIPS))
-                submit_team(pid, random.choice(foods))
+def welch(a, b):
+    if len(a) < 2 or len(b) < 2:
+        return None
+    se = math.sqrt(statistics.variance(a) / len(a) + statistics.variance(b) / len(b))
+    if se == 0:
+        return None
+    t = (statistics.mean(a) - statistics.mean(b)) / se
+    return t, normal_p(t)
+
+
+def stat_text(res, n):
+    if res is None:
+        return f"n = {n}"
+    t, p = res
+    return f"n = {n}, t = {t:.2f}, p ≈ {p:.3f} (normal approximation)"
+
+
+def admin_view():
+    st.title("Host dashboard")
+    if st.text_input("Password", type="password") != ADMIN_PASSWORD:
+        st.stop()
+    st.button("🔄 Refresh")
+
+    df = pd.DataFrame(list(store["participants"].values()))
+    if df.empty:
+        st.info("Nobody has joined yet.")
+        st.stop()
+
+    n_joined = len(df)
+    n_r1 = len(values(df, "r1_to_same"))
+    n_team = int(df["team_name"].notna().sum()) if "team_name" in df else 0
+    n_r2 = len(values(df, "r2_to_same"))
+    a, b, c, d = st.columns(4)
+    a.metric("Joined", n_joined)
+    b.metric("Round 1 done", n_r1)
+    c.metric("Team formed", n_team)
+    d.metric("Round 2 done", n_r2)
+
+    # ---- Round 1: helping the same colour (visible, outward feature) ----
+    st.subheader("Round 1: chips to the same colour")
+    r1 = values(df, "r1_to_same")
+    if r1:
+        m = statistics.mean(r1)
+        st.metric(f"Average chips to the same colour (of {N_CHIPS})", f"{m:.2f}",
+                  delta=f"{m - BASELINE:+.2f} vs. no preference ({BASELINE})")
+        st.caption(stat_text(one_sample(r1), len(r1)))
+        dist = pd.Series(r1).astype(int).value_counts().reindex(range(N_CHIPS + 1), fill_value=0)
+        st.bar_chart(dist.rename("participants"), x_label="Chips given to the same colour",
+                     y_label="Participants")
+
+    # ---- Round 2: team ----
+    st.subheader("Round 2: chips to the own team")
+    if "r2_condition" in df:
+        team = df[(df["r2_condition"] == "team") & df["r2_to_same"].notna()]
+        ctrl = df[(df["r2_condition"] == "control") & df["r2_to_same"].notna()]
+    else:
+        team = ctrl = df.iloc[0:0]
+    to_team = [N_CHIPS - x for x in values(team, "r2_to_same")]
+    if to_team:
+        m2 = statistics.mean(to_team)
+        st.metric(f"Average chips to the own team (of {N_CHIPS})", f"{m2:.2f}",
+                  delta=f"{m2 - BASELINE:+.2f} vs. no preference ({BASELINE})")
+        st.caption(stat_text(one_sample(to_team), len(to_team)))
+    if len(ctrl):
+        to_other = [N_CHIPS - x for x in values(ctrl, "r2_to_same")]
+        st.write(
+            f"Control tables (different colour from another team): {statistics.mean(to_other):.2f} chips "
+            f"vs. own team: {statistics.mean(to_team) if to_team else float('nan'):.2f} chips. "
+            + stat_text(welch(to_team, to_other), len(to_team) + len(to_other))
+        )
+
+    # ---- Round 1 vs. round 2: does the favouritism for the same colour shrink? ----
+    both = df.dropna(subset=["r1_to_same", "r2_to_same"]) if "r2_to_same" in df else df.iloc[0:0]
+    if len(both):
+        st.subheader("Same colour: Round 1 vs. Round 2")
+        r1b, r2b = values(both, "r1_to_same"), values(both, "r2_to_same")
+        chart = pd.DataFrame(
+            {"Average chips to same colour": [statistics.mean(r1b), statistics.mean(r2b)]},
+            index=["Round 1 (no team yet)", "Round 2 (vs. own team)"],
+        )
+        st.bar_chart(chart)
+        diff = [x - y for x, y in zip(r1b, r2b)]
+        st.caption("Paired difference: " + stat_text(one_sample(diff, 0), len(diff)))
+
+    # ---- Connectedness (proxy for social integration) ----
+    cc1, cc2 = values(df, "r1_conn"), values(df, "r2_conn")
+    if cc1 or cc2:
+        st.subheader("Connectedness (1–7)")
+        x, y = st.columns(2)
+        if cc1:
+            x.metric("…to the own colour group (Round 1)", f"{statistics.mean(cc1):.2f}")
+        if cc2:
+            y.metric("…to the own team (Round 2)", f"{statistics.mean(cc2):.2f}")
+
+    st.divider()
+    st.download_button("⬇️ Download raw data (CSV)", df.to_csv(index=False).encode("utf-8"),
+                       file_name="chip_game_results.csv", mime="text/csv")
+    with st.expander("Danger zone"):
+        if st.checkbox("Yes, delete all data") and st.button("Reset game"):
+            with store["lock"]:
+                store["participants"].clear()
+                save()
             st.rerun()
-        if st.checkbox("I want to reset the game (deletes all players and answers)"):
-            if st.button("Reset now"):
-                with S["lock"]:
-                    S["people"].clear()
-                    S["teams"].clear()
-                    S["phase"] = "round1"
-                    random.shuffle(S["order"])
-                    save_state()
-                st.rerun()
-
-    with t_res:
-        results_view()
-        df = get_df()
-        st.download_button("Download CSV", df.to_csv(index=False), "chip_game_results.csv",
-                           "text/csv")
-        with st.expander("Team names"):
-            with S["lock"]:
-                trows = [{"table": int(k) + 1, "food": v["food"], "team_name": v["name"],
-                          "entered_by": v["by"]} for k, v in S["teams"].items()]
-            if trows:
-                st.dataframe(pd.DataFrame(trows).sort_values("table"))
-            else:
-                st.write("No team has entered a food yet.")
-        with st.expander("All players"):
-            st.dataframe(df.sort_values(["table", "color"]))
 
 
+# ----------------------------------------------------------------------------------------------
+# Router
+# ----------------------------------------------------------------------------------------------
 if st.query_params.get("admin") is not None:
-    admin()
+    admin_view()
+    st.stop()
+
+participant = current_participant()
+if participant is None:
+    screen_welcome()
+elif "r1_to_same" not in participant:
+    screen_round1(participant)
+elif "team_name" not in participant:
+    screen_team(participant)
+elif "r2_to_same" not in participant:
+    screen_round2(participant)
 else:
-    participant()
+    screen_done(participant)
