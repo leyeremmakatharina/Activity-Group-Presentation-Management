@@ -13,7 +13,7 @@ Flow for every participant (all on their own phone):
   5. Done            -> host opens the dashboard with ?admin=1
 
 Host dashboard: open the app URL with  ?admin=1  and enter the password
-(set ADMIN_PASSWORD in the Streamlit Cloud secrets, default: "admin").
+(set ADMIN_PASSWORD in the settings block below).
 """
 
 import html
@@ -45,10 +45,7 @@ COLOURS = {  # name: (background, text colour)
 }
 COLOUR_NAMES = list(COLOURS)
 
-try:
-    ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
-except Exception:
-    ADMIN_PASSWORD = "admin"
+ADMIN_PASSWORD = "admin"  # <- CHANGE THIS: your password for the host dashboard (?admin=1)
 
 st.set_page_config(page_title="Chip Game", page_icon="🪙", layout="centered")
 
