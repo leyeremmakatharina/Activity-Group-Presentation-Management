@@ -45,7 +45,7 @@ COLOURS = {  # name: (background, text colour)
 }
 COLOUR_NAMES = list(COLOURS)
 
-ADMIN_PASSWORD = "admin"  # <- CHANGE THIS: your password for the host dashboard (?admin=1)
+ADMIN_PASSWORD = "MGTCB2300"  # <- CHANGE THIS: your password for the host dashboard (?admin=1)
 
 st.set_page_config(page_title="Chip Game", page_icon="🪙", layout="centered")
 
