@@ -1,5 +1,5 @@
 """
-Chip game for the presentation "Cultural diversity, helping behaviour and shared team identity"
+Chip game for the presentation about "Cultural diversity, helping behaviour and shared team identity"
 (based on the minimal group paradigm, Tajfel et al., 1971)
 
 Flow for every participant (all on their own phone):
