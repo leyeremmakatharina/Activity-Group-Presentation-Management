@@ -62,7 +62,7 @@ st.set_page_config(page_title="Chip Game", page_icon="🪙", layout="centered")
 # ----------------------------------------------------------------------------------------------
 @st.cache_resource
 def get_store():
-    store = {"lock": threading.RLock(), "participants": {}, "stage": "r1"}
+    store = {"lock": threading.RLock(), "participants": {}, "stage": "r1", "seq": 0}
     if DATA_FILE.exists():
         try:
             raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -73,9 +73,10 @@ def get_store():
         except Exception:
             pass
     try:
-        saved = json.loads(STAGE_FILE.read_text(encoding="utf-8")).get("stage")
-        if saved in STAGES:
-            store["stage"] = saved
+        meta = json.loads(STAGE_FILE.read_text(encoding="utf-8"))
+        if meta.get("stage") in STAGES:
+            store["stage"] = meta["stage"]
+        store["seq"] = int(meta.get("seq", 0))
     except Exception:
         pass
     return store
@@ -115,10 +116,21 @@ def submit_once(p, flag, **fields):
 
 
 def clear_all():
+    """Delete all participants and answers and go back to Round 1. The id counter is NOT reset,
+    so a phone that is still open from before can never be mixed up with a new participant."""
     with store["lock"]:
+        store["seq"] = max(store["seq"], max(store["participants"], default=0))
         store["participants"].clear()
         _save()
         set_stage("r1")
+
+
+def _save_meta():  # call only while holding the lock
+    try:
+        STAGE_FILE.write_text(
+            json.dumps({"stage": store["stage"], "seq": store["seq"]}), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def get_stage():
@@ -129,10 +141,7 @@ def get_stage():
 def set_stage(stage):
     with store["lock"]:
         store["stage"] = stage
-        try:
-            STAGE_FILE.write_text(json.dumps({"stage": stage}), encoding="utf-8")
-        except Exception:
-            pass
+        _save_meta()
 
 
 def team_info(p):
@@ -195,7 +204,9 @@ def new_code(used):
 def join():
     with store["lock"]:
         ps = store["participants"]
-        pid = max(ps, default=0) + 1
+        pid = max(max(ps, default=0), store["seq"]) + 1
+        store["seq"] = pid
+        _save_meta()
         colour = COLOUR_NAMES[(pid - 1) % len(COLOUR_NAMES)]  # round robin -> balanced colours
         table = None
         if AUTO_TABLES:
@@ -233,6 +244,10 @@ def current_participant():
         p = store["participants"].get(pid)
     if p is not None:
         st.session_state["pid"] = pid
+    elif pid is not None:  # this phone belongs to an old game (after a reset): start fresh
+        st.session_state.pop("pid", None)
+        if "pid" in st.query_params:
+            del st.query_params["pid"]
     return p
 
 
@@ -545,6 +560,20 @@ def stage_controls():
                "(see the numbers below).")
 
 
+def reset_controls(key):
+    if st.session_state.pop("reset_done", False):
+        st.success("The game was reset. All participants and answers are deleted.")
+    with st.expander("🗑 Reset game (delete all participants)"):
+        st.write("Deletes **all participants and answers** and sets the game back to Round 1. "
+                 "All phones go back to the start page. Download the data first if you still "
+                 "need it (tab Data).")
+        sure = st.checkbox("Yes, delete everything", key=f"reset_ok_{key}")
+        if st.button("Reset game now", key=f"reset_btn_{key}", type="primary", disabled=not sure):
+            clear_all()
+            st.session_state["reset_done"] = True
+            st.rerun()
+
+
 @st.fragment(run_every=5)
 def live_counts():
     """Updates itself every 5 seconds, so you can watch the room finish each step."""
@@ -713,6 +742,7 @@ def admin_view():
     tab_live, tab_results, tab_data = st.tabs(["📡 Live", "📊 Results", "🗂 Data"])
     with tab_live:
         stage_controls()
+        reset_controls("live")
         live_counts()
     df = pd.DataFrame(snapshot())
     with tab_results:
@@ -728,10 +758,7 @@ def admin_view():
             st.dataframe(df)
             st.download_button("⬇️ Download raw data (CSV)", df.to_csv(index=False).encode("utf-8"),
                                file_name="chip_game_results.csv", mime="text/csv")
-        with st.expander("Danger zone"):
-            if st.checkbox("Yes, delete all data") and st.button("Reset game"):
-                clear_all()
-                st.rerun()
+        reset_controls("data")
 
 
 # ----------------------------------------------------------------------------------------------
