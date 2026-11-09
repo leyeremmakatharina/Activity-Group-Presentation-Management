@@ -10,7 +10,8 @@ Flow for every participant (all on their own phone):
                    leisure time, choose a team name based on it (= shared team identity)
   4. Round 2    -> split 5 chips between (same colour, other team) and (someone from your own team)
                    + 1 question on how connected they feel to their team
-  5. Done       -> the host shows the results (open the app URL with ?admin=1)
+  5. Done       -> thank-you screen
+The HOST starts every step for everybody (dashboard > Live > Host control), so nobody finishes early.
 
 Host dashboard: open the app URL with  ?admin=1  and enter the password
 (set ADMIN_PASSWORD in the settings block below).
@@ -38,6 +39,8 @@ AUTO_TABLES = True  # True: app assigns the table (guarantees one person per col
 N_TABLES = 9  # number of tables/teams: 9 tables x 4 colours = 36 people (35 to 37 people work fine)
 CONTROL_CONDITION = False  # True: even tables get a control version of round 2
 DATA_FILE = Path("chip_game_data.json")
+STAGE_FILE = Path("chip_game_stage.json")
+STAGES = ["r1", "team", "r2"]  # the host moves everybody from one step to the next
 
 COLOURS = {  # name: (background, text colour)
     "Red": ("#e74c3c", "#ffffff"),
@@ -59,7 +62,7 @@ st.set_page_config(page_title="Chip Game", page_icon="🪙", layout="centered")
 # ----------------------------------------------------------------------------------------------
 @st.cache_resource
 def get_store():
-    store = {"lock": threading.RLock(), "participants": {}}
+    store = {"lock": threading.RLock(), "participants": {}, "stage": "r1"}
     if DATA_FILE.exists():
         try:
             raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -69,6 +72,12 @@ def get_store():
                 store["participants"] = loaded
         except Exception:
             pass
+    try:
+        saved = json.loads(STAGE_FILE.read_text(encoding="utf-8")).get("stage")
+        if saved in STAGES:
+            store["stage"] = saved
+    except Exception:
+        pass
     return store
 
 
@@ -109,6 +118,71 @@ def clear_all():
     with store["lock"]:
         store["participants"].clear()
         _save()
+        set_stage("r1")
+
+
+def get_stage():
+    with store["lock"]:
+        return store["stage"]
+
+
+def set_stage(stage):
+    with store["lock"]:
+        store["stage"] = stage
+        try:
+            STAGE_FILE.write_text(json.dumps({"stage": stage}), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def team_info(p):
+    """Team name of p's table. Any ONE team member can enter it; it then counts for all of them."""
+    with store["lock"]:
+        for q in store["participants"].values():
+            if q.get("table") == p.get("table") and q.get("team_name"):
+                if not p.get("team_name"):  # e.g. somebody who joined the table later
+                    p["team_name"], p["team_common"] = q["team_name"], q.get("team_common", "")
+                    _save()
+                return {"name": q["team_name"], "common": q.get("team_common", "")}
+    return None
+
+
+def team_label(p):
+    info = team_info(p)
+    return info["name"] if info else f"Team {p.get('table')}"
+
+
+def submit_team(p, common, name):
+    """The first member of a table who confirms sets the team name for the whole table."""
+    with store["lock"]:
+        if team_info(p) is not None:
+            return False
+        for q in store["participants"].values():
+            if q.get("table") == p.get("table"):
+                q["team_common"], q["team_name"] = common, name
+        _save()
+        return True
+
+
+def state_sig(p):
+    """Everything that decides which screen a participant should see."""
+    with store["lock"]:
+        q = store["participants"].get(p["id"])
+        if q is None:
+            return None
+        info = team_info(q)
+        return (store["stage"], "r1_to_same" in q, info["name"] if info else None,
+                "r2_to_same" in q)
+
+
+@st.fragment(run_every=3)
+def watch(pid, sig):
+    """Invisible: every 3 seconds checks if the screen has to change (host moved on, or a
+    team member entered the team name) and then reloads the page for this participant."""
+    with store["lock"]:
+        q = store["participants"].get(pid)
+    if q is None or state_sig(q) != sig:
+        st.rerun()
 
 
 def new_code(used):
@@ -342,10 +416,13 @@ def screen_team(p):
         table = st.number_input("Your table number", min_value=1, max_value=99, step=1, key="table_no")
 
     ready = bool(common.strip()) and bool(team_name.strip())
-    if st.button("Continue to Round 2", type="primary", disabled=not ready):
-        submit_once(p, "team_name", team_common=common.strip(), team_name=team_name.strip(),
-                    table=int(table))
+    if st.button("Confirm team name", type="primary", disabled=not ready):
+        if not AUTO_TABLES:
+            update(p, table=int(table))
+        submit_team(p, common.strip(), team_name.strip())
         st.rerun()
+    st.caption("Only ONE person per table needs to do this. As soon as one team member has "
+               "confirmed the name, everybody at your table moves on.")
 
 
 def screen_round2(p):
@@ -375,7 +452,7 @@ def screen_round2(p):
         def other_card(title):
             recipient_card(title, other, note="from another team")
     else:
-        team = html.escape(p["team_name"])
+        team = html.escape(team_label(p))
 
         def other_card(title):
             recipient_card(title, text=f"Someone from your own team<br>“{team}”")
@@ -396,7 +473,14 @@ def screen_round2(p):
 def screen_done(p):
     banner(p)
     st.header("Thank you! 🎉")
-    st.write("You are done. Please look up to the front: the results will be shown in a moment.")
+    st.write("You are done. Thank you for taking part!")
+
+
+def screen_wait(p, text, show_team=False):
+    banner(p)
+    if show_team:
+        st.success(f"Your team: **{html.escape(team_label(p))}** (table {p.get('table')})")
+    st.info(text)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -447,6 +531,20 @@ def stat_text(res, n):
 # ----------------------------------------------------------------------------------------------
 # Host dashboard (?admin=1)
 # ----------------------------------------------------------------------------------------------
+def stage_controls():
+    st.subheader("Host control")
+    cur = get_stage()
+    labels = {"r1": "1️⃣ Round 1", "team": "2️⃣ Team time", "r2": "3️⃣ Round 2"}
+    cols = st.columns(len(STAGES))
+    for col, s in zip(cols, STAGES):
+        if col.button(labels[s], key=f"stage_{s}", type="primary" if s == cur else "secondary"):
+            set_stage(s)
+            st.rerun()
+    st.caption("Everybody sees the step you select here. People who are finished wait on a waiting "
+               "screen until you start the next step. Start the next step when most people are done "
+               "(see the numbers below).")
+
+
 @st.fragment(run_every=5)
 def live_counts():
     """Updates itself every 5 seconds, so you can watch the room finish each step."""
@@ -457,7 +555,9 @@ def live_counts():
     a, b, c, d = st.columns(4)
     a.metric("Joined", len(df))
     b.metric("Round 1 done", len(values(df, "r1_to_same")))
-    c.metric("Team formed", int(df["team_name"].notna().sum()) if "team_name" in df else 0)
+    n_tables = int(df["table"].nunique()) if "table" in df else 0
+    named = int(df.loc[df["team_name"].notna(), "table"].nunique()) if "team_name" in df else 0
+    c.metric("Teams named", f"{named} of {n_tables}")
     d.metric("Round 2 done", len(values(df, "r2_to_same")))
     st.caption("This view refreshes automatically every 5 seconds.")
 
@@ -612,6 +712,7 @@ def admin_view():
 
     tab_live, tab_results, tab_data = st.tabs(["📡 Live", "📊 Results", "🗂 Data"])
     with tab_live:
+        stage_controls()
         live_counts()
     df = pd.DataFrame(snapshot())
     with tab_results:
@@ -640,15 +741,27 @@ if st.query_params.get("admin") is not None:
     admin_view()
     st.stop()
 
+def route(p):
+    stage = get_stage()
+    if "r1_to_same" not in p:  # always finish Round 1 first (also for people who joined late)
+        screen_round1(p)
+    elif "r2_to_same" in p:
+        screen_done(p)
+    elif stage == "r1":
+        screen_wait(p, "✅ Round 1 is done. Please wait until the host starts the next step.")
+    elif stage == "team":
+        if team_info(p) is None:
+            screen_team(p)
+        else:
+            screen_wait(p, "✅ Your team is set. Please wait until the host starts Round 2.",
+                        show_team=True)
+    else:  # stage == "r2"
+        screen_round2(p)
+
+
 participant = current_participant()
 if participant is None:
     screen_welcome()
-elif "r1_to_same" not in participant:
-    screen_round1(participant)
-elif "team_name" not in participant:
-    screen_team(participant)
-elif "r2_to_same" not in participant:
-    screen_round2(participant)
 else:
-    screen_done(participant)
-
+    route(participant)
+    watch(participant["id"], state_sig(participant))
