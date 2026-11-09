@@ -505,42 +505,12 @@ def values(df, col):
     return df[col].dropna().astype(float).tolist() if col in df else []
 
 
-def normal_p(t):
-    return 2 * (1 - 0.5 * (1 + math.erf(abs(t) / math.sqrt(2))))
-
-
 def mean_ci(xs):
     m = statistics.mean(xs)
     if len(xs) < 2:
         return m, m, m
     se = statistics.stdev(xs) / math.sqrt(len(xs))
     return m, m - 1.96 * se, m + 1.96 * se
-
-
-def one_sample(xs, mu=BASELINE):
-    if len(xs) < 2 or statistics.stdev(xs) == 0:
-        return None
-    t = (statistics.mean(xs) - mu) / (statistics.stdev(xs) / math.sqrt(len(xs)))
-    return t, normal_p(t)
-
-
-def mcnemar_exact(b, c):
-    n = b + c
-    if n == 0:
-        return 1.0
-    k = min(b, c)
-    return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n)
-
-
-def p_text(p):
-    return "p < .001" if p < 0.001 else f"p = {p:.3f}"
-
-
-def stat_text(res, n):
-    if res is None:
-        return f"n = {n}"
-    t, p = res
-    return f"n = {n}, t = {t:.2f}, " + (p_text(p) if p is not None else "") + " (normal approximation)"
 
 
 # ----------------------------------------------------------------------------------------------
@@ -654,17 +624,6 @@ def render_results(df):
     m1.metric("Round 1: favoured their own colour", f"{pct1:.0f}%")
     m2.metric("Round 2: favoured their own team", f"{pct2:.0f}%")
 
-    text = (
-        f"In Round 1, **{pct1:.0f}%** of the participants gave more than half of their chips to someone "
-        f"with their own colour. In Round 2 the same-colour option was still there, but **{pct2:.0f}%** "
-        f"gave more than half of their chips to their own team, although all team members had a "
-        f"*different* colour."
-    )
-    if n_col:
-        text += (f" Of the {n_col} people who favoured their colour in Round 1, **{b} "
-                 f"({100 * b / n_col:.0f}%)** switched to their team.")
-    st.success(text)
-
     st.subheader("How the shared identity changes who gets the chips")
     st.altair_chart(results_chart(r1, r2))
     st.caption("Bars show the average number of chips; black lines show the 95% confidence interval; "
@@ -681,18 +640,11 @@ def render_results(df):
         index=["Round 1: gave more to same colour", "Round 1: gave more to different colour"],
     )
     st.table(table)
-    st.caption(f"{b} people switched from their colour to their team, {c} switched in the other direction "
-               f"({p_text(mcnemar_exact(b, c))}, exact McNemar test).")
+    st.caption(f"{b} people switched from their colour to their team, {c} switched in the other direction.")
 
     diff = [x - y for x, y in zip(r1, r2)]
-    res = one_sample(diff, 0)
-    sd = statistics.stdev(diff) if len(diff) > 1 else 0
-    st.write(
-        f"On average, participants gave **{statistics.mean(diff):.2f} fewer chips** to their own colour "
-        f"in Round 2 than in Round 1"
-        + (f" (paired t-test: t = {res[0]:.2f}, {p_text(res[1])}; effect size d = "
-           f"{statistics.mean(diff) / sd:.2f})." if res and sd else ".")
-    )
+    st.write(f"On average, participants gave **{statistics.mean(diff):.2f} fewer chips** to their own "
+             f"colour in Round 2 than in Round 1.")
 
     st.subheader("Connectedness (1–7)")
     c1, c2 = values(main, "r1_conn"), values(main, "r2_conn")
@@ -701,18 +653,6 @@ def render_results(df):
         x.metric("…to the own colour group (Round 1)", f"{statistics.mean(c1):.2f}")
         y.metric("…to the own team (Round 2)", f"{statistics.mean(c2):.2f}",
                  delta=f"{statistics.mean(c2) - statistics.mean(c1):+.2f}")
-        dres = one_sample([b2 - a1 for a1, b2 in zip(c1, c2)], 0)
-        st.caption("Proxy for social integration. Difference: " + stat_text(dres, len(c1)))
-
-    with st.expander("Distribution of the choices"):
-        dist = pd.DataFrame(
-            {
-                "Round 1": pd.Series(r1).value_counts().reindex(range(N_CHIPS + 1), fill_value=0),
-                "Round 2": pd.Series(r2).value_counts().reindex(range(N_CHIPS + 1), fill_value=0),
-            }
-        )
-        dist.index.name = "Chips given to the same colour"
-        st.bar_chart(dist, stack=False, y_label="Participants")
 
     if len(ctrl):
         st.subheader("Control tables")
