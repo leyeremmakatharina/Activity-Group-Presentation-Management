@@ -422,22 +422,23 @@ def screen_team(p):
         "find something you **all have in common regarding your leisure time**, for example a "
         "favourite food, movie, music, hobby, ...  \n"
         "Your colours are only outward features. What you find now is something you **really share**, "
-        "and it makes you a team. Give your team a name based on it."
+        "and it makes you a team. **What you share is your team name**, so just type it in below."
     )
-    common = st.text_input("What do you all have in common?", max_chars=60, key="team_common")
-    team_name = st.text_input("Your team name", max_chars=30, key="team_name_input")
+    common = st.text_input("What do you all have in common? (this is your team name)",
+                           max_chars=40, key="team_common")
+    name = " ".join(common.split())
+    name = name[:1].upper() + name[1:]
     table = p.get("table")
     if not AUTO_TABLES:
         table = st.number_input("Your table number", min_value=1, max_value=99, step=1, key="table_no")
 
-    ready = bool(common.strip()) and bool(team_name.strip())
-    if st.button("Confirm team name", type="primary", disabled=not ready):
+    if st.button("Confirm team name", type="primary", disabled=not name):
         if not AUTO_TABLES:
             update(p, table=int(table))
-        submit_team(p, common.strip(), team_name.strip())
+        submit_team(p, name, name)  # the first entry of a table counts, later ones are ignored
         st.rerun()
-    st.caption("Only ONE person per table needs to do this. As soon as one team member has "
-               "confirmed the name, everybody at your table moves on.")
+    st.caption("Only ONE person per table needs to do this. If several people enter something, "
+               "the first entry is used. The host moves everybody on to Round 2.")
 
 
 def screen_round2(p):
